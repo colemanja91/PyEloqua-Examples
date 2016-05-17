@@ -26,10 +26,7 @@ class Eloqua(object):
     ## Description: given a CDO ID, returns available field names and their API statements.
     ##              Useful for creating import / export definitions
     ## Parameters:
-    ##      company: Eloqua instance company name; string
-    ##      username: Eloqua username; string
-    ##      password: Eloqua password; string
-    ##      pod: Eloqua instance pod (Settings -> Company Defaults -> POD: POD{#}); integer
+    ##      entity: what type of fields to retrieve
     ##      cdoID: Custom Data Object ID; integer
     ##      fields: List of fields to retreive from Eloqua (optional; if not used, method returns all fields); array
     ##
@@ -37,11 +34,20 @@ class Eloqua(object):
     ##
     ## Usage:
     ##  fields = ['']
-    ##  fieldStatements = getFieldStatements('mycompany', 'myuser', 'mypassword', 1, 123, fields)
+    ##  fieldStatements = getFieldStatements(123, fields)
 
-    def getFieldStatements(self, cdoID, fields=[]):
+    def getFields(self, entity, cdoID=0, fields=[]):
 
-        url = self.urlBase + '/API/Bulk/2.0/customobjects/' + str(cdoID) + '/fields'
+        if entity not in ['contacts', 'customObjects', 'activity', 'accounts']:
+            raise Exception("Please choose a valid 'entity' value: 'contacts', 'accounts'")
+
+        if entity == 'customObjects':
+            if cdoID==0:
+                raise Exception("Please specify a cdoID")
+
+            url = self.urlBase + '/API/Bulk/2.0/customobjects/' + str(cdoID) + '/fields'
+        else:
+            url = self.urlBase + '/API/Bulk/2.0/' + entity + '/fields'
 
         req = requests.get(url, auth = (self.company + '\\' + self.username, self.password))
 
@@ -56,6 +62,9 @@ class Eloqua(object):
                     if item['name'] in fields:
 
                         fieldsReturn.append(item)
+                    else:
+                        if item['internalName'] in fields:
+                            fieldsReturn.append(item)
 
                 if (len(fieldsReturn)<len(fields)):
 
@@ -69,42 +78,107 @@ class Eloqua(object):
 
         else:
 
-            return req.status_code
+            raise Exception("Failure getting fields: " + str(req.status_code))
 
-    ## Method: createDef
-    ##
-    ## Description: Given a set of fields and filters, create an import / export definition
-    ##
-    ## Parameters:
-    ##      company: Eloqua instance company name; string
-    ##      username: Eloqua username; string
-    ##      password: Eloqua password; string
-    ##      pod: Eloqua instance pod (Settings -> Company Defaults -> POD: POD{#}); integer
-    ##      defType: type of definition; string ['imports', 'exports']
-    ##      defName: Export definition name; string; default = datetime stamp
-    ##      cdoID: Custom Data Object ID; integer
-    ##      fields: list of field name statements; dictionary; create using getFieldStatements
-    ##      filters: a filter statement; string
-    ##      identifierFieldName: Name of unique identifier field (imports only); string
-    ##      isSyncTriggeredOnImport: automatically sync when data is POST'ed to the definiton; boolean
-    ##
-    ## Output: On successful definition creation, a dictionary containing details of the definition; if unsuccessful, a warning containing the returned JSON
+    ## create field statement for import / export definition
+    def createFieldStatement(self, entity, fields = '', cdoID = 0, useInternalName=True, addSystemFields=[]):
+        fieldSet = self.getFields(entity = entity, fields = fields, cdoID = cdoID)
 
-    def createDef(self, defType, cdoID, fields, filters='', defName=datetime.now(), identifierFieldName='', isSyncTriggeredOnImport=False):
+        fieldStatement = {}
 
-        if (len(fields)>100):
+        if len(addSystemFields)>0:
+            for field in addSystemFields:
+                if field in self.contactSystemFields:
+                    fieldStatement[field] = self.contactSystemFields[field]
+                else:
+                    raise Exception("System field not recognized: " + field)
 
-            raise Exception("Eloqua Bulk API can only export 100 CDO fields at a time")
+        if len(fieldSet)>0:
+            for field in fieldSet:
+                if useInternalName:
+                    fieldStatement[field['internalName']] = field['statement']
+                else:
+                    fieldStatement[field['name']] = field['statement']
+            return fieldStatement
+        else:
+            raise Exception("No fields found")
+
+    ## get CDO ID from name
+    def getCdoId(self, cdoName):
+        url = self.urlBase + '/API/Bulk/2.0/customobjects?q="name=' + str(cdoName) + '"'
+
+        req = requests.get(url, auth = (self.company + '\\' + self.username, self.password))
+
+        if req.json()['totalResults']==1:
+            cdoUri = req.json()['items'][0]['uri']
+            cdoId = int(cdoUri.replace('/customObjects/', ''))
+            return cdoId
+        elif req.json()['totalResults']>1:
+            raise Exception("Multiple CDOs with matching name")
+        else:
+            raise Exception("No matching CDOs found")
+
+    ## create filter criteria based on shared filters, lists, segments, or account lists
+
+    def filterExists(self, name, existsType):
+
+        if existsType=='ContactFilter':
+            url = self.urlBase + '/API/Bulk/2.0/contacts/filters?q="name=' + name + '"'
+        elif existsType=='ContactSegment':
+            url = self.urlBase + '/API/Bulk/2.0/contacts/segments?q="name=' + name + '"'
+        elif existsType=='ContactList':
+            url = self.urlBase + '/API/Bulk/2.0/contacts/lists?q="name=' + name + '"'
+        elif existsType=='AccountList':
+            url = self.urlBase + '/API/Bulk/2.0/accounts/lists?q="name=' + name + '"'
+        else:
+            raise Exception("Please choose a valid 'existsType': 'ContactFilter', 'ContactSegment', 'ContactList', 'AccountList'")
+
+        req = requests.get(url, auth = (self.company + '\\' + self.username, self.password))
+
+        if req.json()['totalResults']==1:
+            filterStatement = "EXISTS('" + req.json()['items'][0]['statement'] + "')"
+            return filterStatement
+        elif req.json()['totalResults']>1:
+            raise Exception("Multiple " + existsType + "s found")
+        else:
+            raise Exception("No matching " + existsType + " found")
+
+    # Create export definition
+
+    def createDef(self, defType, entity, fields, cdoID=0, filters='', defName=str(datetime.now()), identifierFieldName='', isSyncTriggeredOnImport=False):
 
         if (defType not in ['imports', 'exports']):
-
             raise Exception("Please choose a defType value: 'imports', 'exports'")
+
+        if len(fields)==0:
+            raise Exception("Please specify at least one field to export")
+
+        if (defType == 'imports' and len(fields)>100):
+            raise Exception("Eloqua Bulk API only supports imports of up to 100 fields")
+
+        if entity not in ['contacts', 'customObjects', 'accounts']:
+            raise Exception("Please choose a valid 'entity' value: 'contacts', 'accounts', 'customObjects'")
+
+        if entity == 'customObjects':
+            if cdoID==0:
+                raise Exception("Please specify a cdoID")
+            if (len(fields)>100):
+                raise Exception("Eloqua Bulk API can only export 100 CDO fields at a time")
+            url = self.urlBase + '/API/Bulk/2.0/customobjects/' + str(cdoID) + '/' + defType
+
+        if entity == 'contacts':
+            if (len(fields)>250):
+                raise Exception("Eloqua Bulk API can only export 250 contact fields at a time")
+            url = self.urlBase + '/API/Bulk/2.0/contacts/' + defType
+
+        if entity == 'accounts':
+            if len(fields)>100:
+                raise Exception("Eloqua Bulk API can only export 100 account fields at a time")
+            url = self.urlBase + '/API/Bulk/2.0/accounts/' + defType
 
         ##if (defType=='imports' & len(identifierFieldName) not in fields.keys()):
 
         ##    raise Exception("Imports must had an identifierFieldName which is included in the specified fields")
-
-        url = self.urlBase + '/API/Bulk/2.0/customobjects/' + str(cdoID) + '/' + defType
 
         headers = {'Content-Type':'application/json'}
 
@@ -281,3 +355,11 @@ class Eloqua(object):
             else:
                 #raise Exception("Could not import data (" + uri + "): " + req.json()['failures'][0])
                 raise Exception(req.json()['failures'][0])
+
+    contactSystemFields = {
+        "contactID": "{{Contact.Id}}",
+        "createdAt": "{{Contact.CreatedAt}}",
+        "updatedAt": "{{Contact.UpdatedAt}}",
+        "isSubscribed": "{{Contact.Email.IsSubscribed}}",
+        "isBounced": "{{Contact.Email.IsBounced}}"
+    }
